@@ -1,0 +1,2 @@
+zarr>=3
+numpy
