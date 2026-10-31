@@ -1,0 +1,2 @@
+duckdb>=2.0
+pyarrow
