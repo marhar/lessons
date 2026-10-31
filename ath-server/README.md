@@ -10,6 +10,9 @@ python server.py                    # http://127.0.0.1:8000 -> http://localhost:
 python server.py --port 9000 --vm http://vm:8428 --host 0.0.0.0
 ```
 
+There is also a C++ port in [`cpp/`](cpp/README.md). Its responses are identical,
+and it includes a test that checks this.
+
 ## API
 
 The API follows VictoriaMetrics and Prometheus where it can, so their docs and
@@ -199,3 +202,50 @@ Safety:
 - The DuckDB external file cache is turned off, because VictoriaMetrics answers
   are live data.
 - The server binds to `127.0.0.1` by default.
+
+DuckDB HTTP settings:
+
+- `force_download = true` makes each read a single `GET`. DuckDB would otherwise
+  send a `HEAD` first, and when VictoriaMetrics returns a 5xx to that `HEAD`, its
+  error message is lost.
+- `http_retries = 0` because DuckDB backs off for 30–70 s on a 503 or 429. It's
+  better to answer 502 at once and let the client decide whether to retry.
+
+## Tests
+
+```sh
+pip install -r requirements-dev.txt
+make test         # builds the C++ server, then runs every test against both servers
+make test-py      # just server.py: pytest --impl=py
+make test-live    # both servers against a real VictoriaMetrics; they must agree
+```
+
+Most tests are black-box HTTP tests in `tests/`, run once per implementation.
+The servers point at `tests/fake_vm.py`, a small stand-in for VictoriaMetrics.
+
+**The fake VictoriaMetrics** serves the fixed data in `tests/data.py`: five minutes
+of samples whose values are chosen so every expected answer can be worked out by
+hand. It copies real VictoriaMetrics behaviour where the servers depend on it:
+
+- whole numbers are written without `.0`;
+- staleness markers are `null`;
+- a series can be split across several lines;
+- a bad selector gets a `text/plain` 400.
+
+It also records each request it receives, so tests can check exactly what was
+sent to VictoriaMetrics. Setting `vm.fail = (status, body)` makes every request
+fail.
+
+**The test files:**
+
+| File | Covers |
+|---|---|
+| `test_times.py` | Every time and duration form, through the resolved `start`/`end`/`step` that responses echo; every `bad time` and `bad duration` message |
+| `test_samples.py` | Raw samples, every `agg`, bucket alignment, staleness markers, series ordering |
+| `test_latest.py` | Newest sample per series, the `v2big.sql` selectors |
+| `test_metrics.py` | Metric names, and the exact URLs sent to VictoriaMetrics |
+| `test_formats.py` | Content types, exact CSV text, Python-style JSON, Parquet and Arrow schemas and rows |
+| `test_errors.py` | Every validation error, VM 400 passed through, VM 5xx giving 502, VM unreachable giving 500 |
+| `test_live.py` | `-m live` only: 26 requests sent to both servers against a real VictoriaMetrics. JSON and CSV must match byte for byte; Parquet and Arrow must decode to equal tables. Use `--live-vm URL` to point elsewhere. |
+
+If `cpp/build/ath-server` hasn't been built, the C++ tests are skipped, not failed.

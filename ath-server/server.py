@@ -73,12 +73,13 @@ def parse_duration(s):
     """'90s', '1h30m' or bare seconds ('60') -> ms."""
     try:
         return int(float(s) * 1000)
-    except ValueError:
+    except (ValueError, OverflowError):  # nan, inf
         pass
     parts = DURATION_RE.findall(s)
-    if not parts or ''.join(n + u for n, u in parts) != s:
+    total = sum(float(n) * UNITS_MS[u] for n, u in parts)
+    if not parts or ''.join(n + u for n, u in parts) != s or not math.isfinite(total):
         raise BadRequest(f'bad duration {s!r}: use e.g. 30s, 5m, 1h30m')
-    return int(sum(float(n) * UNITS_MS[u] for n, u in parts))
+    return int(total)
 
 
 def parse_time(s, now_ms):
@@ -91,7 +92,7 @@ def parse_time(s, now_ms):
         return now_ms - parse_duration(s[1:])
     try:
         return int(float(s) * 1000)
-    except ValueError:
+    except (ValueError, OverflowError):  # nan, inf
         pass
     try:
         dt = datetime.fromisoformat(s)
@@ -332,8 +333,14 @@ def main():
     args = ap.parse_args()
     VM_URL = args.vm.rstrip('/')
 
-    # VictoriaMetrics answers are live; never serve a cached HTTP body
-    Handler.con = duckdb.connect(config={'enable_external_file_cache': False})
+    # VictoriaMetrics answers are live: never serve a cached HTTP body.
+    # One GET per read, no HEAD first, so VM's error bodies come through.
+    # No retries: DuckDB backs off for up to a minute on 503/429; fail fast instead.
+    Handler.con = duckdb.connect(config={
+        'enable_external_file_cache': False,
+        'force_download': True,
+        'http_retries': 0,
+    })
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f'listening on http://{args.host}:{args.port} -> {VM_URL}')
