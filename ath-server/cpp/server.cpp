@@ -319,12 +319,15 @@ samples AS (
 )
 )";
 
-// buckets are aligned to start, stamped with the bucket's start time
+// buckets are aligned to start, stamped with the bucket's start time.
+// ts >= $start keeps // (which truncates toward zero) from folding earlier
+// samples into the first bucket; NaN/Inf would poison avg/sum/min/max.
 static const std::string BUCKETED = R"(,
 bucketed AS (
     SELECT name, labels, $start + (ts - $start) // $step * $step AS bucket,
            {agg} AS value
     FROM samples
+    WHERE ts >= $start AND isfinite(value)
     GROUP BY name, labels, bucket
 ),
 points AS (SELECT name, labels, bucket AS ts, value FROM bucketed)

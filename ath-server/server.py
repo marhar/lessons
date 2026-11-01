@@ -26,6 +26,7 @@ import os
 import re
 import tempfile
 import time
+import traceback
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -67,19 +68,22 @@ class BadRequest(Exception):
 UNITS_MS = {'ms': 1, 's': 1000, 'm': 60_000, 'h': 3_600_000,
             'd': 86_400_000, 'w': 604_800_000, 'y': 31_536_000_000}
 DURATION_RE = re.compile(r'(\d+(?:\.\d+)?)(ms|s|m|h|d|w|y)')
+# 9999-12-31T23:59:59.999Z; keeps every time and step a BIGINT DuckDB can bind
+MAX_MS = 253_402_300_799_999
 
 
 def parse_duration(s):
     """'90s', '1h30m' or bare seconds ('60') -> ms."""
     try:
-        return int(float(s) * 1000)
-    except (ValueError, OverflowError):  # nan, inf
-        pass
-    parts = DURATION_RE.findall(s)
-    total = sum(float(n) * UNITS_MS[u] for n, u in parts)
-    if not parts or ''.join(n + u for n, u in parts) != s or not math.isfinite(total):
+        ms = float(s) * 1000
+    except ValueError:
+        parts = DURATION_RE.findall(s)
+        ms = sum(float(n) * UNITS_MS[u] for n, u in parts)
+        if not parts or ''.join(n + u for n, u in parts) != s:
+            ms = math.nan
+    if not abs(ms) <= MAX_MS:  # also false for nan, inf
         raise BadRequest(f'bad duration {s!r}: use e.g. 30s, 5m, 1h30m')
-    return int(total)
+    return int(ms)
 
 
 def parse_time(s, now_ms):
@@ -90,14 +94,19 @@ def parse_time(s, now_ms):
         return now_ms - parse_duration(s[4:])
     if s.startswith('-'):
         return now_ms - parse_duration(s[1:])
+    bad = BadRequest(f'bad time {s!r}: use unix seconds, RFC3339, now or -1h')
     try:
-        return int(float(s) * 1000)
-    except (ValueError, OverflowError):  # nan, inf
+        ms = float(s) * 1000
+    except ValueError:
         pass
+    else:
+        if not abs(ms) <= MAX_MS:  # also false for nan, inf
+            raise bad
+        return int(ms)
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
-        raise BadRequest(f'bad time {s!r}: use unix seconds, RFC3339, now or -1h')
+        raise bad
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
@@ -143,12 +152,15 @@ samples AS (
 )
 """
 
-# buckets are aligned to start, stamped with the bucket's start time
+# buckets are aligned to start, stamped with the bucket's start time.
+# ts >= $start keeps // (which truncates toward zero) from folding earlier
+# samples into the first bucket; NaN/Inf would poison avg/sum/min/max.
 BUCKETED = """,
 bucketed AS (
     SELECT name, labels, $start + (ts - $start) // $step * $step AS bucket,
            {agg} AS value
     FROM samples
+    WHERE ts >= $start AND isfinite(value)
     GROUP BY name, labels, bucket
 ),
 points AS (SELECT name, labels, bucket AS ts, value FROM bucketed)
@@ -216,6 +228,10 @@ class Handler(BaseHTTPRequestHandler):
             self.error(code, f'victoriametrics: {body or e}')
         except duckdb.Error as e:
             self.error(500, str(e))
+        except Exception as e:
+            # pyarrow, temp files, ...: still answer, rather than drop the connection
+            self.log_error('%s', traceback.format_exc())
+            self.error(500, f'internal error: {e}')
 
     def metrics(self, params, fmt, cur):
         q = [('match[]', m) for m in params.get('match[]', [])]

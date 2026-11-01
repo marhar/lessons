@@ -105,6 +105,9 @@ def bad_duration(s):
     ({'start': 'now-'}, bad_duration('')),
     ({'start': '-5m2'}, bad_duration('5m2')),
     ({'start': '-' + '9' * 400 + 's'}, bad_duration('9' * 400 + 's')),
+    ({'start': '-99999999999y'}, bad_duration('99999999999y')),   # finite, but no BIGINT
+    ({'start': '1e300', 'end': FAR}, bad_time('1e300')),
+    ({'start': T0, 'end': '1e300'}, bad_time('1e300')),
     ({'end': 'bad', 'start': 'bad2'}, bad_time('bad')),  # end is parsed first
     ({'start': T0 + 60, 'end': T0}, 'start must be before end'),
     ({'start': T0, 'end': T0}, 'start must be before end'),
@@ -113,6 +116,7 @@ def bad_duration(s):
     ({'step': '-5'}, 'step must be positive'),
     ({'step': '1q'}, bad_duration('1q')),
     ({'step': 'inf'}, bad_duration('inf')),
+    ({'step': '1e300'}, bad_duration('1e300')),
 ])
 def test_bad_times(server, params, error):
     r = server.get('/api/v1/samples', ('match[]', 'none'), **params)
