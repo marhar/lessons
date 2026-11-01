@@ -666,6 +666,7 @@ static void samples(Request &rq) {
     if (has(p, "step")) {
         step = parse_duration(last(p, "step"));
         if (*step <= 0) throw BadRequest("step must be positive");
+        // Prometheus' own check: buckets count both ends, so up to MAX_POINTS + 1
         if ((end - start) / *step > MAX_POINTS)
             throw BadRequest("more than " + std::to_string(MAX_POINTS) +
                              " points per series: raise step or shorten the range");

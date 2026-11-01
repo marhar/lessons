@@ -262,6 +262,7 @@ class Handler(BaseHTTPRequestHandler):
             step = parse_duration(params['step'][-1])
             if step <= 0:
                 raise BadRequest('step must be positive')
+            # Prometheus' own check: buckets count both ends, so up to MAX_POINTS + 1
             if (end - start) // step > MAX_POINTS:
                 raise BadRequest(f'more than {MAX_POINTS} points per series: '
                                  'raise step or shorten the range')
