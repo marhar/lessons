@@ -629,6 +629,33 @@ static const std::vector<std::string> &matches(const Params &p) {
     return p.at("match[]");
 }
 
+// /samples and /latest JSON: {"status": "success", "start": S, "end": E ... (caller may add keys)
+static std::string envelope(int64_t start, int64_t end) {
+    std::string out = "{\"status\": \"success\", \"start\": ";
+    json_int(out, start);
+    out += ", \"end\": ";
+    json_int(out, end);
+    return out;
+}
+
+// ... , "data": [{"name": .., "labels": .., <rest>}, ...]}, rest(out, chunk, row) writing each
+// series' remaining fields; name and labels are columns 0 and 1
+template <class F>
+static std::string close_with_series(std::string out, Result &r, F rest) {
+    out += ", \"data\": [";
+    bool first = true;
+    each_row(r, [&](duckdb_data_chunk c, idx_t i) {
+        out += first ? "{\"name\": " : ", {\"name\": ";
+        first = false;
+        json_nullable_str(out, duckdb_data_chunk_get_vector(c, 0), i);
+        out += ", \"labels\": ";
+        json_map(out, duckdb_data_chunk_get_vector(c, 1), i);
+        rest(out, c, i);
+        out += '}';
+    });
+    return out + "]}";
+}
+
 static void metrics(Request &rq) {
     Pairs q;
     if (has(rq.params, "match[]"))
@@ -686,27 +713,14 @@ static void samples(Request &rq) {
 
     if (rq.fmt != "json") return table(rq, sql + TABLE, args, true);
     auto r = run(rq.con, sql + SERIES, args);
-    std::string out = "{\"status\": \"success\", \"start\": ";
-    json_int(out, start);
-    out += ", \"end\": ";
-    json_int(out, end);
-    out += ", \"step\": ";
+    auto out = envelope(start, end) + ", \"step\": ";
     step ? json_int(out, *step) : void(out += "null");
-    out += ", \"data\": [";
-    bool first = true;
-    each_row(*r, [&](duckdb_data_chunk c, idx_t i) {
-        out += first ? "{\"name\": " : ", {\"name\": ";
-        first = false;
-        json_nullable_str(out, duckdb_data_chunk_get_vector(c, 0), i);
-        out += ", \"labels\": ";
-        json_map(out, duckdb_data_chunk_get_vector(c, 1), i);
+    send_json(rq, close_with_series(out, *r, [](std::string &out, duckdb_data_chunk c, idx_t i) {
         out += ", \"timestamps\": ";
         json_list<int64_t>(out, duckdb_data_chunk_get_vector(c, 2), i);
         out += ", \"values\": ";
         json_list<double>(out, duckdb_data_chunk_get_vector(c, 3), i);
-        out += '}';
-    });
-    send_json(rq, out + "]}");
+    }));
 }
 
 static void latest(Request &rq) {
@@ -716,25 +730,12 @@ static void latest(Request &rq) {
     auto sql = SAMPLES + LATEST;
     if (rq.fmt != "json") return table(rq, sql + TABLE, args, true);
     auto r = run(rq.con, sql + "SELECT * FROM points ORDER BY name, labels", args);
-    std::string out = "{\"status\": \"success\", \"start\": ";
-    json_int(out, start);
-    out += ", \"end\": ";
-    json_int(out, end);
-    out += ", \"data\": [";
-    bool first = true;
-    each_row(*r, [&](duckdb_data_chunk c, idx_t i) {
-        out += first ? "{\"name\": " : ", {\"name\": ";
-        first = false;
-        json_nullable_str(out, duckdb_data_chunk_get_vector(c, 0), i);
-        out += ", \"labels\": ";
-        json_map(out, duckdb_data_chunk_get_vector(c, 1), i);
+    send_json(rq, close_with_series(envelope(start, end), *r, [](std::string &out, duckdb_data_chunk c, idx_t i) {
         out += ", \"timestamp\": ";
         json_int(out, at<int64_t>(duckdb_data_chunk_get_vector(c, 2), i));
         out += ", \"value\": ";
         json_nullable_float(out, duckdb_data_chunk_get_vector(c, 3), i);
-        out += '}';
-    });
-    send_json(rq, out + "]}");
+    }));
 }
 
 // The C API reports an HTTP failure's status in its message but not the
