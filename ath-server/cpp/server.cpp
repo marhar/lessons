@@ -740,9 +740,13 @@ static void latest(Request &rq) {
 
 // The C API reports an HTTP failure's status in its message but not the
 // response body, so ask VictoriaMetrics again for its own error text.
+// Short timeouts: this runs while VM is failing, and on a timeout the
+// caller falls back to DuckDB's message.
 static std::string vm_error_body(const std::string &url) {
     auto split = url.find('/', url.find("://") + 3);
     httplib::Client cli(url.substr(0, split));
+    cli.set_connection_timeout(2);
+    cli.set_read_timeout(3);
     auto res = cli.Get(url.substr(split));
     if (!res) return "";
     auto &b = res->body;

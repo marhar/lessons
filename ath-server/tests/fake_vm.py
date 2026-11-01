@@ -12,12 +12,14 @@ Selectors support name, name{...} and {...} with = != =~ !~ (regexes fully
 anchored, a missing label matches ""), which is all the tests need.
 
 Each request's path is appended to .requests, so tests can check what
-ath-server asked for. Set .fail = (status, body) to make every request fail.
+ath-server asked for. Set .fail = (status, body) to make every request fail,
+and .stall = seconds to hold every request after the first that long.
 """
 import json
 import math
 import re
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -74,6 +76,7 @@ class FakeVM:
         self.lines = list(self.default)  # export lines: {"metric", "timestamps", "values"}
         self.requests = []
         self.fail = None
+        self.stall = 0
 
     def close(self):
         self.srv.shutdown()
@@ -126,6 +129,8 @@ class FakeVM:
         class Handler(BaseHTTPRequestHandler):
             def reply(self, head):
                 vm.requests.append(self.path)
+                if vm.stall and len(vm.requests) > 1:
+                    time.sleep(vm.stall)
                 url = urllib.parse.urlsplit(self.path)
                 code, ctype, body = vm.respond(url.path, urllib.parse.parse_qs(url.query))
                 data = body.encode()

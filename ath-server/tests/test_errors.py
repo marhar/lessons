@@ -1,4 +1,5 @@
 """Error responses: request validation, and VictoriaMetrics failing or missing."""
+import time
 import urllib.parse
 
 import pytest
@@ -78,6 +79,16 @@ def test_vm_errors_in_every_format(server, vm, fmt):
     vm.fail = (500, 'storage on fire')
     r = server.get('/api/v1/samples', ('match[]', 'demo_metric'), start=T0, end=T0 + 60, format=fmt)
     assert error(r)[0] == 502
+
+
+def test_vm_stalling_after_an_error_does_not_hang(server, vm):
+    # the C++ server asks VM again for the error body; that retry must time out
+    vm.fail, vm.stall = (503, 'busy'), 15
+    t = time.time()
+    status, body = error(server.get('/api/v1/latest', ('match[]', 'x'), start=T0, end=T0 + 60))
+    assert time.time() - t < 10
+    assert status == 502
+    assert body['error'].startswith('victoriametrics: ')
 
 
 def test_vm_unreachable_is_500(server, spawn):
