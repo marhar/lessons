@@ -46,6 +46,8 @@ namespace fs = std::filesystem;
 static std::string VM_URL = "http://localhost:8428";
 constexpr int64_t DEFAULT_RANGE_MS = 3'600'000;  // start defaults to end - 1h
 constexpr int64_t MAX_POINTS = 11'000;           // per series, same cap as Prometheus query_range
+// 9999-12-31T23:59:59.999Z; also keeps end - start and the bucket math far from int64 overflow
+constexpr int64_t MAX_MS = 253'402'300'799'999;
 
 using Pairs = std::vector<std::pair<std::string, std::string>>;
 
@@ -115,7 +117,8 @@ static std::optional<double> py_float(const std::string &raw) {
     std::string t;
     for (size_t i = 0; i < s.size(); i++) {
         if (s[i] != '_') { t += s[i]; continue; }
-        if (i == 0 || i + 1 == s.size() || !isdigit(s[i - 1]) || !isdigit(s[i + 1])) return std::nullopt;
+        if (i == 0 || i + 1 == s.size() || !isdigit((unsigned char)s[i - 1]) || !isdigit((unsigned char)s[i + 1]))
+            return std::nullopt;
     }
     if (t.find_first_of("xX(") != std::string::npos) return std::nullopt;
     char *end;
@@ -124,9 +127,9 @@ static std::optional<double> py_float(const std::string &raw) {
     return v;
 }
 
-// int(x): truncate toward zero; nullopt where Python would fail or C++ would overflow
+// int(x) of a time or duration in ms: truncate toward zero; nullopt for nan, inf or past MAX_MS
 static std::optional<int64_t> py_int(double x) {
-    if (!std::isfinite(x) || std::fabs(x) >= 9.2e18) return std::nullopt;
+    if (!(std::fabs(x) <= MAX_MS)) return std::nullopt;
     return (int64_t)x;
 }
 
@@ -137,7 +140,8 @@ static std::string unquote_plus(const std::string &s) {
     std::string out;
     for (size_t i = 0; i < s.size(); i++) {
         if (s[i] == '+') out += ' ';
-        else if (s[i] == '%' && i + 2 < s.size() && isxdigit(s[i + 1]) && isxdigit(s[i + 2]))
+        else if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) &&
+                 isxdigit((unsigned char)s[i + 2]))
             out += (char)std::stoi(s.substr(i + 1, 2), nullptr, 16), i += 2;
         else out += s[i];
     }
@@ -184,6 +188,8 @@ static std::string urlencode(const Pairs &q) {
 // Accepts what Prometheus/VictoriaMetrics accept: unix seconds, RFC3339,
 // 'now', and relative durations ('-1h', 'now-30m'). Everything is resolved
 // to epoch ms once per request, so start and end share the same 'now'.
+// A leading '-' is always relative: -3600 means an hour ago, not 1969, as
+// in VictoriaMetrics (Prometheus has no relative times).
 
 static int64_t now_ms() {
     using namespace std::chrono;
@@ -321,13 +327,14 @@ samples AS (
 
 // buckets are aligned to start, stamped with the bucket's start time.
 // ts >= $start keeps // (which truncates toward zero) from folding earlier
-// samples into the first bucket; NaN/Inf would poison avg/sum/min/max.
+// samples into the first bucket. A NaN would poison avg/sum/min/max; ±Inf
+// (VictoriaMetrics exports it as "Infinity") and null are kept.
 static const std::string BUCKETED = R"(,
 bucketed AS (
     SELECT name, labels, $start + (ts - $start) // $step * $step AS bucket,
            {agg} AS value
     FROM samples
-    WHERE ts >= $start AND isfinite(value)
+    WHERE ts >= $start AND isnan(value) IS NOT TRUE
     GROUP BY name, labels, bucket
 ),
 points AS (SELECT name, labels, bucket AS ts, value FROM bucketed)
@@ -360,7 +367,9 @@ GROUP BY name, labels
 ORDER BY name, labels
 )";
 
-static const std::string METRICS = "SELECT unnest(data) AS name FROM read_json($url)";
+// explicit type: with no names, read_json would infer JSON[]
+static const std::string METRICS =
+    "SELECT unnest(data) AS name FROM read_json($url, columns = {'data': 'VARCHAR[]'})";
 
 // -- DuckDB C API -----------------------------------------------------------------
 
@@ -433,15 +442,27 @@ static std::string str_at(duckdb_vector v, idx_t row) {
 // Written like Python's json.dumps defaults: ", " and ": " separators,
 // non-ASCII as \uXXXX, floats as repr() ("154.0", "1e-05").
 
+// bytes.decode('utf-8', 'replace'): only well-formed sequences (no overlongs,
+// surrogates or code points past U+10FFFF), and one U+FFFD per maximal bad prefix
 static std::string utf8_or_replace(const std::string &s) {
     std::string out;
     for (size_t i = 0; i < s.size();) {
         auto c = (unsigned char)s[i];
-        size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
-        bool ok = n && i + n <= s.size();
-        for (size_t j = 1; ok && j < n; j++) ok = ((unsigned char)s[i + j] >> 6) == 2;
-        if (ok) out.append(s, i, n), i += n;
-        else out += "\xEF\xBF\xBD", i++;
+        if (c < 0x80) { out += (char)c, i++; continue; }
+        size_t n = 0;
+        unsigned char lo = 0x80, hi = 0xbf;  // allowed range of the second byte
+        if (c >= 0xc2 && c <= 0xdf) n = 2;
+        else if (c >= 0xe0 && c <= 0xef) n = 3, lo = c == 0xe0 ? 0xa0 : 0x80, hi = c == 0xed ? 0x9f : 0xbf;
+        else if (c >= 0xf0 && c <= 0xf4) n = 4, lo = c == 0xf0 ? 0x90 : 0x80, hi = c == 0xf4 ? 0x8f : 0xbf;
+        size_t j = 1;
+        while (n && j < n && i + j < s.size()) {
+            auto b = (unsigned char)s[i + j];
+            if (b < (j == 1 ? lo : 0x80) || b > (j == 1 ? hi : 0xbf)) break;
+            j++;
+        }
+        if (n && j == n) out.append(s, i, n);
+        else out += "\xEF\xBF\xBD";
+        i += j;
     }
     return out;
 }
@@ -613,8 +634,14 @@ static void metrics(Request &rq) {
     if (has(rq.params, "match[]"))
         for (auto &m : rq.params.at("match[]")) q.emplace_back("match[]", m);
     // VictoriaMetrics picks its own default range when none is given
+    // end is parsed first and both share one 'now', as in time_range
+    int64_t now = now_ms();
+    std::map<std::string, int64_t> times;
+    for (auto k : {"end", "start"})
+        if (has(rq.params, k)) times[k] = parse_time(last(rq.params, k), now);
+    if (times.size() == 2 && times["start"] >= times["end"]) throw BadRequest("start must be before end");
     for (auto k : {"start", "end"})
-        if (has(rq.params, k)) q.emplace_back(k, seconds(parse_time(last(rq.params, k), now_ms())));
+        if (times.count(k)) q.emplace_back(k, seconds(times[k]));
     rq.vm = VM_URL + "/api/v1/label/__name__/values?" + urlencode(q);
     Args args = {{"url", rq.vm}};
     if (rq.fmt != "json") return table(rq, METRICS, args, false);
@@ -752,9 +779,12 @@ static Reply handle(duckdb_database db, const std::string &target) {
             // pass VictoriaMetrics' own message through (bad selector, etc.)
             std::smatch m;
             std::string msg = e.what();
-            bool is400 = std::regex_search(msg, m, std::regex(R"(\(HTTP (\d{3}))")) && m[1] == "400";
+            static const std::regex STATUS_RE(R"(\(HTTP (\d{3}))");
+            int status = std::regex_search(msg, m, STATUS_RE) ? std::stoi(m[1]) : 0;
+            // the query was rejected; 404 (wrong --vm) and 429 are VM-side problems
+            bool rejected = status >= 400 && status < 500 && status != 404 && status != 429;
             auto body = vm_error_body(rq.vm);
-            send_error(reply, is400 ? 400 : 502, "victoriametrics: " + (body.empty() ? msg : body));
+            send_error(reply, rejected ? 400 : 502, "victoriametrics: " + (body.empty() ? msg : body));
         } else {
             send_error(reply, 500, e.what());
         }
@@ -768,7 +798,8 @@ static Reply handle(duckdb_database db, const std::string &target) {
 static void log_request(const httplib::Request &req, const httplib::Response &res) {
     char when[32];
     auto t = std::time(nullptr);
-    std::strftime(when, sizeof when, "%d/%b/%Y %H:%M:%S", std::localtime(&t));
+    std::tm tm;
+    std::strftime(when, sizeof when, "%d/%b/%Y %H:%M:%S", localtime_r(&t, &tm));
     fprintf(stderr, "%s - - [%s] \"%s %s %s\" %d -\n", req.remote_addr.c_str(), when, req.method.c_str(),
             req.target.c_str(), req.version.c_str(), res.status);
 }

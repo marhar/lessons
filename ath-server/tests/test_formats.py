@@ -98,6 +98,12 @@ def test_binary_metrics(server, fmt):
     assert t.column('name').to_pylist()[0] == 'demo_metric'
 
 
+@pytest.mark.parametrize('fmt', ['parquet', 'arrow'])
+def test_binary_metrics_empty_keeps_string_type(server, fmt):
+    t = decode(get(server, '/api/v1/metrics', 'nothing_here', format=fmt))
+    assert (t.num_rows, t.schema.field('name').type) == (0, pa.string())
+
+
 @pytest.mark.parametrize('fmt', ['csv', 'parquet', 'arrow'])
 def test_empty_tables(server, fmt):
     r = get(server, '/api/v1/samples', 'nothing_here', format=fmt)

@@ -8,7 +8,9 @@ see the same data. JSON, CSV and error bodies must match byte for byte;
 Parquet and Arrow must decode to equal tables.
 """
 import io
+import math
 import time
+import urllib.parse
 import urllib.request
 
 import pyarrow as pa
@@ -72,3 +74,26 @@ def test_same_answer(servers, target):
         assert decode(py).equals(decode(cpp))
     else:
         assert py.body == cpp.body
+
+
+@pytest.fixture(scope='module')
+def inf_series(request, servers):
+    """athtest_inf with ±Inf samples, written into the live VM and deleted afterwards."""
+    url = request.config.getoption('live_vm')
+    sel = urllib.parse.urlencode({'match[]': 'athtest_inf'})
+    # VM drops NaN on import and exports ±Inf as the strings "Infinity"/"-Infinity"
+    lines = ''.join(f'athtest_inf {v} {(A + 10 * i) * 1000}\n' for i, v in enumerate(['1', '+Inf', '4', '-Inf', '2']))
+    urllib.request.urlopen(url + '/api/v1/import/prometheus', data=lines.encode(), timeout=5).read()
+    urllib.request.urlopen(url + '/internal/force_flush', timeout=5).read()
+    yield
+    urllib.request.urlopen(url + '/api/v1/admin/tsdb/delete_series?' + sel, data=b'', timeout=5).read()
+
+
+@pytest.mark.parametrize('agg, want', [('max', math.inf), ('min', -math.inf), ('count', 5.0), ('last', 2.0)])
+def test_infinity_is_a_value(servers, inf_series, agg, want):
+    # one bucket over all five samples; ±Inf counts, like any other sample
+    target = f'/api/v1/samples?match[]=athtest_inf&start={A}&end={A + 60}&step=1m&agg={agg}&format=parquet'
+    for srv in servers:
+        r = srv.raw(target)
+        assert r.status == 200, (srv.impl, r)
+        assert decode(r).column('value').to_pylist() == [want], srv.impl

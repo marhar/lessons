@@ -64,6 +64,8 @@ class BadRequest(Exception):
 # Accepts what Prometheus/VictoriaMetrics accept: unix seconds, RFC3339,
 # 'now', and relative durations ('-1h', 'now-30m'). Everything is resolved
 # to epoch ms once per request, so start and end share the same 'now'.
+# A leading '-' is always relative: -3600 means an hour ago, not 1969, as
+# in VictoriaMetrics (Prometheus has no relative times).
 
 UNITS_MS = {'ms': 1, 's': 1000, 'm': 60_000, 'h': 3_600_000,
             'd': 86_400_000, 'w': 604_800_000, 'y': 31_536_000_000}
@@ -154,13 +156,14 @@ samples AS (
 
 # buckets are aligned to start, stamped with the bucket's start time.
 # ts >= $start keeps // (which truncates toward zero) from folding earlier
-# samples into the first bucket; NaN/Inf would poison avg/sum/min/max.
+# samples into the first bucket. A NaN would poison avg/sum/min/max; ±Inf
+# (VictoriaMetrics exports it as "Infinity") and null are kept.
 BUCKETED = """,
 bucketed AS (
     SELECT name, labels, $start + (ts - $start) // $step * $step AS bucket,
            {agg} AS value
     FROM samples
-    WHERE ts >= $start AND isfinite(value)
+    WHERE ts >= $start AND isnan(value) IS NOT TRUE
     GROUP BY name, labels, bucket
 ),
 points AS (SELECT name, labels, bucket AS ts, value FROM bucketed)
@@ -193,7 +196,8 @@ GROUP BY name, labels
 ORDER BY name, labels
 """
 
-METRICS = "SELECT unnest(data) AS name FROM read_json($url)"
+# explicit type: with no names, read_json would infer JSON[]
+METRICS = "SELECT unnest(data) AS name FROM read_json($url, columns = {'data': 'VARCHAR[]'})"
 
 
 def finite(v):
@@ -224,7 +228,8 @@ class Handler(BaseHTTPRequestHandler):
         except duckdb.HTTPException as e:
             # pass VictoriaMetrics' own message through (bad selector, etc.)
             body = (e.body or '').strip()
-            code = 400 if e.status_code == 400 else 502
+            # the query was rejected; 404 (wrong --vm) and 429 are VM-side problems
+            code = 400 if 400 <= e.status_code < 500 and e.status_code not in (404, 429) else 502
             self.error(code, f'victoriametrics: {body or e}')
         except duckdb.Error as e:
             self.error(500, str(e))
@@ -235,9 +240,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def metrics(self, params, fmt, cur):
         q = [('match[]', m) for m in params.get('match[]', [])]
-        # VictoriaMetrics picks its own default range when none is given
-        q += [(k, f'{parse_time(params[k][-1], int(time.time() * 1000)) / 1000:.3f}')
-              for k in ('start', 'end') if k in params]
+        # VictoriaMetrics picks its own default range when none is given;
+        # end is parsed first and both share one 'now', as in time_range
+        now_ms = int(time.time() * 1000)
+        times = {k: parse_time(params[k][-1], now_ms) for k in ('end', 'start') if k in params}
+        if times.keys() == {'start', 'end'} and times['start'] >= times['end']:
+            raise BadRequest('start must be before end')
+        q += [(k, f'{times[k] / 1000:.3f}') for k in ('start', 'end') if k in times]
         vm = f'{VM_URL}/api/v1/label/__name__/values?{urllib.parse.urlencode(q)}'
         rel = cur.sql(METRICS, params={'url': vm})
         if fmt == 'json':

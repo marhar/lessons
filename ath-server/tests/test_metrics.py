@@ -29,6 +29,18 @@ def test_range_is_passed_as_seconds(server, vm):
         ('match[]', 'demo_metric'), ('start', '1793318400.000'), ('end', '1793318700.500')]
 
 
+def test_relative_range_shares_one_now(server, vm):
+    server.get('/api/v1/metrics', start='-1h', end='now')
+    q = dict(vm.last_query('/api/v1/label/__name__/values'))
+    assert round((float(q['end']) - float(q['start'])) * 1000) == 3_600_000
+
+
+def test_range_must_be_forward(server):
+    for start, end in [(T0 + 60, T0), (T0, T0), ('now', '-1h')]:
+        r = server.get('/api/v1/metrics', start=start, end=end)
+        assert (r.status, r.json()) == (400, {'status': 'error', 'error': 'start must be before end'})
+
+
 def test_export_request(server, vm):
     server.get('/api/v1/samples', ('match[]', 'demo_metric'), ('match[]', '{__name__=~".*_total"}'),
                start=T0, end=T0 + 60.25)

@@ -117,6 +117,8 @@ def bad_duration(s):
     ({'step': '1q'}, bad_duration('1q')),
     ({'step': 'inf'}, bad_duration('inf')),
     ({'step': '1e300'}, bad_duration('1e300')),
+    ({'step': '1e14'}, bad_duration('1e14')),                  # past MAX_MS, but fits int64
+    ({'start': T0, 'end': '1e12'}, bad_time('1e12')),
 ])
 def test_bad_times(server, params, error):
     r = server.get('/api/v1/samples', ('match[]', 'none'), **params)
