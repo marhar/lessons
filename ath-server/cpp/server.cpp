@@ -569,6 +569,8 @@ static void json_list(std::string &out, duckdb_vector v, idx_t row) {
 }
 
 // -- requests ---------------------------------------------------------------------
+// Every response is built whole in memory, and nothing bounds memory per
+// request yet: see https://github.com/marhar/lessons/issues/1
 
 struct Reply {
     int code = 200;

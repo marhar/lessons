@@ -310,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
         return m
 
     # -- responses ----------------------------------------------------------
+    # Every response is built whole in memory, and nothing bounds memory per
+    # request yet: see https://github.com/marhar/lessons/issues/1
 
     def table(self, rel, fmt):
         """Long format (name, labels, ts, value) as csv, parquet or arrow."""
